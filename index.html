@@ -2692,8 +2692,8 @@ body.menu-beat .eq span { filter: brightness(1.5); }
                     </li>
                     <li>
                         <b>Overcharge on the beat</b>
-                        <span>A ring expands from the core in time with the track. Tap <em>OVERCHARGE</em>
-                        (or <em>SPACE</em>) as it reaches the white line for a screen-wide shockwave and bonus XP.
+                        <span>A ring expands from the core in time with the track. Tap anywhere
+                        (or press <em>SPACE</em>) as it reaches the white line for a screen-wide shockwave and bonus XP.
                         Miss, and it locks for two bars.</span>
                     </li>
                     <li>
@@ -5549,6 +5549,11 @@ const LEVEL_UP_FIRST_DELAY = 20; // no draft in the first seconds of a run
 // XP income climbs fastest) and settles to the long-run rate after.
 const XP_GROWTH_EARLY = 1.6;
 const XP_GROWTH = 1.35;
+/* Drafts are about a third as frequent as they were, so each level now
+   carries some power of its own: a flat damage bonus and a small heal.
+   Without it the slower pacing simply made the player weaker. */
+const LEVEL_DAMAGE_BONUS = 0.12;
+const LEVEL_HEAL = 12;
 const OC_XP_SHARE = 0.03;      // fraction of the next level per clean hit
 
 /* THE NAMES ARE THE GENRE.
@@ -5567,7 +5572,7 @@ const OC_XP_SHARE = 0.03;      // fraction of the next level per clean hit
    hit, and a weapon sharing either name would blur the one cue the
    whole game is built on. */
 const ALL_ABILITIES = {
-    pulseBolt: { name: 'Staccato Volley', icon: '⚡', desc: 'Short, sharp notes fired at the nearest shape.', level: 1, maxLevel: ABILITY_MAX_LEVEL, cooldown: 0.6, timer: 0, baseDamage: 22, count: 1 },
+    pulseBolt: { name: 'Staccato Volley', icon: '⚡', desc: 'Short, sharp notes fired at the nearest shape.', level: 1, maxLevel: ABILITY_MAX_LEVEL, cooldown: 0.6, timer: 0, baseDamage: 30, count: 1 },
     orbitalShield: { name: 'Arpeggio Ring', icon: '🛡️', desc: 'Chord tones circling the core, cutting whatever they pass through.', level: 0, maxLevel: ABILITY_MAX_LEVEL, angle: 0, baseDamage: 16, count: 2, radius: 75 },
     repulsorAura: { name: 'Sub Bass', icon: '🔮', desc: 'A low-end pressure field that thumps everything standing too close.', level: 0, maxLevel: ABILITY_MAX_LEVEL, cooldown: 0.25, timer: 0, baseDamage: 6, range: 90 },
     laserBeam: { name: 'Sustain Beam', icon: '🔴', desc: 'One held note, burning through whatever it is aimed at.', level: 0, maxLevel: ABILITY_MAX_LEVEL, baseDamage: 3, timer: 0, cooldown: 0.05 },
@@ -6291,7 +6296,10 @@ let tutorialHits = 0;
 // of how many runs the save has.
 let tutorialForce = false;
 // Seconds of play until the next draft may be raised. See LEVEL_UP_MIN_GAP.
-let levelUpCooldown = 0;        // clean Overcharges landed while coached (2 to pass)
+let levelUpCooldown = 0;
+// gameTime of the last full-damage hit. See HIT GUARD in damagePlayer().
+let lastHitTime = -99;
+const HIT_GUARD_SEC = 0.5;        // clean Overcharges landed while coached (2 to pass)
 // Consecutive clean Overcharges. Feeds the score, so holding tempo for a
 // whole wave is worth more than landing one hit a bar.
 let ocStreak = 0;
@@ -6399,6 +6407,24 @@ const BALANCE = {
     touchPerEdge:   0.10,   // +10% contact damage per edge above a triangle
     bossKnockResistPerBoss: 0.10   // stacking, from the second boss onward
 };
+
+/* THE OPENING IS EASED. The early waves scale minion health, speed and contact
+   damage down, tapering to full strength by wave 10. Measured with bots:
+   before this, a player who never pressed Overcharge died in 18 seconds
+   and one who landed a hit every three seconds died in 32 — the first
+   boss was irrelevant because almost nobody would have met it. The
+   late game is untouched: every factor is 1 from wave 10 on. Health is
+   eased for longest because drafts now come about a third as often, so
+   the player's damage climbs more slowly than the original curve assumed. */
+const EARLY_EASE = {
+    hp:    [0.50, 0.45, 0.45, 0.45, 0.55, 0.65, 0.70, 0.80, 0.90],
+    speed: [0.65, 0.70, 0.80, 0.85, 0.95],
+    touch: [0.50, 0.50, 0.55, 0.60, 0.70, 0.70, 0.80, 0.90]
+};
+function earlyEase(kind, w) {
+    let t = EARLY_EASE[kind];
+    return (w >= 1 && w <= t.length) ? t[w - 1] : 1;
+}
 
 function enemyBaseHp(edges, w) {
     return (edges - 2) * BALANCE.minionHp * (1 + (w - 1) * BALANCE.minionHpGrowth);
@@ -6968,6 +6994,34 @@ window.addEventListener('keydown', e => {
 
 shockwaveBtn.onclick = triggerShockwave;
 
+/* TAP ANYWHERE TO OVERCHARGE.
+
+   The button was a desktop habit: Space was the input and the button was
+   its touch stand-in, which made a phone player aim a thumb at a target
+   while watching a ring somewhere else. The whole arena is now the
+   button. A press on the canvas during play fires the Overcharge; the
+   Fever, mute and Overcharge buttons are separate elements above the
+   canvas and keep their own taps, and every modal covers the canvas, so
+   a tap on a card or a menu can never reach this. pointerdown, not
+   click: click waits for the finger to lift, and on a rhythm input that
+   delay is the difference between IN TEMPO and LATE. */
+canvas.addEventListener('pointerdown', (e) => {
+    if (gameState !== 'PLAYING') return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    triggerShockwave();
+});
+// The button fires on press as well, for the same reason. Its click
+// handler stays for keyboard activation; the flag stops a double fire.
+let _ocPressAt = 0;
+shockwaveBtn.addEventListener('pointerdown', (e) => {
+    if (shockwaveBtn.disabled) return;
+    e.preventDefault();
+    _ocPressAt = performance.now();
+    triggerShockwave();
+});
+shockwaveBtn.onclick = () => { if (performance.now() - _ocPressAt > 400) triggerShockwave(); };
+
 // --- BOSS BULLET PATTERNS ---
 function fireBossPattern(boss) {
     let edges = boss.edges;
@@ -6981,7 +7035,7 @@ function fireBossPattern(boss) {
             vx: Math.cos(angle) * spd,
             vy: Math.sin(angle) * spd,
             radius: 7,
-            damage: 14 + wave * 2,
+            damage: (14 + wave * 2) * (boss.firstBoss ? 0.5 : 1),
             color: PAL.bossBullet,
             // Stamped once here rather than parsed out of the hex string
             // four times per bullet per frame by the renderer.
@@ -7036,6 +7090,14 @@ function handleEnemySpawning(dt) {
 
             let bossEdges = Math.min(9, 6 + Math.floor((wave / 5) - 1));
             let bossHp = bossBaseHp(bossEdges, wave);
+            /* THE FIRST BOSS OF A RUN IS A TEACHING FIGHT. It arrives about
+               ninety seconds in, when a new player has two or three
+               upgrades; at full strength it ended most first runs right
+               there. It keeps its look and its pattern but has a quarter of the
+               health, fires less often and hits for less. Every later
+               boss is unchanged. */
+            let firstBoss = bossWavesCleared === 0;
+            if (firstBoss) bossHp *= 0.25;
             let bossRadius = 60 + bossEdges * 4;
 
             let angle = Math.random() * Math.PI * 2;
@@ -7044,15 +7106,16 @@ function handleEnemySpawning(dt) {
 
             let bossObj = {
                 x: ex, y: ey, edges: bossEdges, radius: bossRadius,
-                hp: bossHp, maxHp: bossHp, speed: 0.35 * enemySpeedScale(),
+                hp: bossHp, maxHp: bossHp, speed: (firstBoss ? 0.26 : 0.35) * enemySpeedScale(),
+                firstBoss: firstBoss,
                 color: '#ff0055', stroke: '#ffffff',
-                touchDamage: 25 + wave * 3, xpValue: 150, slowTimer: 0,
+                touchDamage: (25 + wave * 3) * (firstBoss ? 0.45 : 1), xpValue: 150, slowTimer: 0,
                 // Baked at spawn like speed, so a boss cannot change how
                 // hard it is to move partway through its own fight.
                 knockResist: bossKnockResist(),
                 rotation: 0, rotationSpeed: 0.4,
                 isBoss: true, spawnProgress: 0,
-                attackTimer: 0, attackCooldown: Math.max(0.7, 1.8 - (wave * 0.04)),
+                attackTimer: 0, attackCooldown: firstBoss ? 3.0 : Math.max(0.7, 1.8 - (wave * 0.04)),
                 vx: 0, vy: 0
             };
 
@@ -7085,12 +7148,18 @@ function handleEnemySpawning(dt) {
        where it was, so the change reads as "each shape takes real work"
        rather than "there are more of them". By wave 8 it converges on the
        old rate again, where the pressure is meant to be. */
-    let spawnInterval = Math.max(0.20, 1.10 - (wave * 0.115));
+    let spawnInterval = Math.max(0.20, 1.22 - (wave * 0.125));
 
     if (spawnTimer >= spawnInterval) {
         spawnTimer = 0;
         let maxEdges = 3 + (wave - 1);
         let edges = Math.min(8, Math.random() < 0.7 && wave > 1 ? 3 + Math.floor(Math.random() * wave) : maxEdges);
+        /* Shape size climbs one edge every two waves until wave 10. The
+           original curve added an edge every wave, so the wave after the
+           first boss opened with octagons at 60 contact damage against a
+           player holding five upgrades — bots that beat the boss died
+           within ten seconds of it. */
+        edges = Math.min(edges, 3 + Math.floor(wave / 2));
 
         let isRainbow = Math.random() < 0.22 && wave >= 2;
         if (isRainbow) {
@@ -7107,10 +7176,10 @@ function handleEnemySpawning(dt) {
         let ex = player.x + Math.cos(angle) * spawnR;
         let ey = player.y + Math.sin(angle) * spawnR;
 
-        let baseHp = enemyBaseHp(edges, wave);
+        let baseHp = enemyBaseHp(edges, wave) * earlyEase('hp', wave);
         if (isRainbow) baseHp *= 1.25;
 
-        let speed = (1.4 + (edges - 3) * 0.15) * enemySpeedScale();
+        let speed = (1.4 + (edges - 3) * 0.15) * enemySpeedScale() * earlyEase('speed', wave);
         // A third larger than it was: at the phone's close zoom a wave-1
         // triangle was eight pixels across, which is a dot, not a threat.
         let radius = 16 + edges * 3.6;
@@ -7119,7 +7188,7 @@ function handleEnemySpawning(dt) {
         enemies.push({
             x: ex, y: ey, edges, radius, hp: baseHp, maxHp: baseHp, speed,
             color: colors.fill, stroke: colors.stroke,
-            touchDamage: enemyTouchDamage(edges), xpValue: edges * 2, slowTimer: 0,
+            touchDamage: enemyTouchDamage(edges) * earlyEase('touch', wave), xpValue: edges * 2, slowTimer: 0,
             rotation: Math.random() * Math.PI * 2,
             rotationSpeed: (Math.random() < 0.5 ? 1 : -1) * (1.0 + Math.random() * 0.8),
             isRainbow: isRainbow,
@@ -7666,7 +7735,15 @@ function damagePlayer(amount, srcX, srcY) {
         return true;
     }
 
-    let taken = Math.max(1, amount * (1 - player.armor));
+    /* HIT GUARD. An Overcharge shoves a crowd outward and it comes back
+       as a ring, arriving in the same half-second; with every contact at
+       full damage that took a run from 95 health to zero in under four
+       seconds, with nothing the player could do. A hit landing within
+       HIT_GUARD_SEC of the previous one now does 30% damage. One hit
+       hurts exactly as before; a pile-up no longer deletes the run. */
+    let guarded = (gameTime - lastHitTime) < HIT_GUARD_SEC;
+    if (!guarded) lastHitTime = gameTime;
+    let taken = Math.max(1, amount * (1 - player.armor) * (guarded ? 0.3 : 1));
     player.hp -= taken;
     hpFlash = 1;
     createExplosion(Number.isFinite(srcX) ? srcX : player.x,
@@ -7829,6 +7906,8 @@ function checkLevelUp() {
         levelUpCooldown = LEVEL_UP_MIN_GAP;
         player.xp -= player.nextXp;
         player.level++;
+        player.damageMult += LEVEL_DAMAGE_BONUS;
+        player.hp = Math.min(player.maxHp, player.hp + LEVEL_HEAL);
         player.nextXp = Math.floor(player.nextXp * (player.level <= 5 ? XP_GROWTH_EARLY : XP_GROWTH));
         gameState = 'LEVEL_UP';
         showLevelUpModal();
@@ -8277,6 +8356,7 @@ function resetGame() {
     score = 0; gameTime = 0; wave = 1; waveTimer = 15; enemiesKilled = 0;
     ocStreak = 0; tutorialHits = 0;
     levelUpCooldown = LEVEL_UP_FIRST_DELAY;
+    lastHitTime = -99;
     feverKills = 0; feverReady = false; isFever = false; feverTimer = 0;
     overchargeOscTime = 0; shockwaveCooldown = 0; screenShake = 0;
     isBossWave = false; bossDefeatedForDraft = false; bossBullets = [];
@@ -8293,7 +8373,7 @@ function resetGame() {
     player.x = 0; player.y = 0;
     player.maxHp = 100 + tree.maxHp;
     player.hp = player.maxHp;
-    player.hpRegen = 0.1 + tree.hpRegen;
+    player.hpRegen = 0.5 + tree.hpRegen;   // was 0.1: a leak or two a minute should heal back
     player.level = 1; player.xp = 0; player.nextXp = XP_FIRST_LEVEL;
     player.magnetAccel = 8.0 + tree.magnetAccel;
     player.damageMult = tree.damageMult;
@@ -8486,7 +8566,7 @@ function tutorialCoachLine() {
     } else {
         let hint = tutorialMisses >= 2
             ? `Watch the <em>ring</em>, not the shapes. ${IS_TOUCH ? 'Tap' : 'Press SPACE'} as it <em>touches the white line</em>.`
-            : (again ? `Good. <em>Again</em> on the next ring.` : `Watch the ring grow from the core. ${IS_TOUCH ? 'Tap <em>OVERCHARGE</em>' : 'Press <em>SPACE</em>'} when it reaches the <em>white line</em>.`);
+            : (again ? `Good. <em>Again</em> on the next ring.` : `Watch the ring grow from the core. ${IS_TOUCH ? '<em>Tap anywhere</em>' : 'Press <em>SPACE</em> or click'} when it reaches the <em>white line</em>.`);
         showTip(hint, 'coach');
     }
 }
@@ -11455,7 +11535,22 @@ function gameLoop(timestamp) {
        once and skipped, and the next frame is scheduled regardless: a
        glitch instead of a dead game. */
     try {
-        if (dt < 0.1) update(dt);
+        /* FIXED TIMESTEP. Shapes, bolts and bullets move a set distance
+           per update, so the simulation used to run at the DISPLAY's
+           speed: twice as fast on a 120Hz phone, half speed at 30fps,
+           while spawns and cooldowns kept real time. update() now always
+           advances exactly 1/60s and is called as many times as real
+           time requires. A frame within 3ms of 1/60s counts as exactly
+           one step, so a 60Hz display never judders between 0 and 2. */
+        if (dt < 0.1) {
+            if (Math.abs(dt - SIM_DT) < 0.003) { update(SIM_DT); simAcc = 0; }
+            else {
+                simAcc += dt;
+                let steps = 0;
+                while (simAcc >= SIM_DT && steps < 5) { update(SIM_DT); simAcc -= SIM_DT; steps++; }
+                if (steps === 5) simAcc = 0;
+            }
+        } else simAcc = 0;
         render();
     } catch (err) {
         if (loopErrorCount++ < 5) { console.error('[frame skipped]', err); YT.logError(err); }
@@ -11477,6 +11572,9 @@ function gameLoop(timestamp) {
    resume everything is re-armed and lastTimestamp is reset so the first
    frame back does not integrate the whole pause as one giant dt.
    ========================================================== */
+const SIM_DT = 1 / 60;
+let simAcc = 0;
+
 function hostPause() {
     if (hostPaused) return;
     hostPaused = true;
